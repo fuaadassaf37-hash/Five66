@@ -47,7 +47,7 @@ async function readAll() {
   }
 }
 
-// كتابة مجموعة مفاتيح (upsert)
+// كتابة مجموعة مفاتيح (upsert) — يفشل بوضوح إذا فشل الحفظ على Supabase
 async function writeMany(entries) {
   // entries: {key1: value1, key2: value2, ...}
   // نحفظ نسخة محلية احتياطية دوماً
@@ -58,13 +58,12 @@ async function writeMany(entries) {
 
   if (!supabase) return local;
 
-  try {
-    const rows = Object.keys(entries).map(key => ({ key, value: entries[key] }));
-    rows.push({ key: '_updatedAt', value: local._updatedAt });
-    const { error } = await supabase.from('kv_store').upsert(rows, { onConflict: 'key' });
-    if (error) throw error;
-  } catch (e) {
-    console.error('Supabase writeMany error (تم الحفظ محلياً فقط):', e.message);
+  const rows = Object.keys(entries).map(key => ({ key, value: entries[key] }));
+  rows.push({ key: '_updatedAt', value: local._updatedAt });
+  const { error } = await supabase.from('kv_store').upsert(rows, { onConflict: 'key' });
+  if (error) {
+    console.error('فشل الحفظ في Supabase:', error.message);
+    throw new Error('فشل حفظ التعديل في قاعدة البيانات الأساسية: ' + error.message);
   }
   return local;
 }

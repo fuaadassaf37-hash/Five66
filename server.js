@@ -15,14 +15,24 @@ const db = require('./db');
 const PORT = process.env.PORT || 3000;
 
 // ----- تحقق إلزامي من وجود بيانات الدخول -----
-// لا يُسمح بتشغيل السيرفر بدون اسم مستخدم/كلمة مرور محدَّدين صراحة في .env
-// (كان هذا الجزء غائباً سابقاً رغم وجود express-basic-auth في package.json،
-//  ما يعني أن أي شخص يعرف الرابط كان يقدر يقرأ/يكتب كامل قاعدة البيانات بدون أي تسجيل دخول)
-const APP_USER = process.env.APP_USER;
-const APP_PASS = process.env.APP_PASS;
-if (!APP_USER || !APP_PASS) {
-  console.error('❌ يجب ضبط APP_USER و APP_PASS في ملف .env قبل تشغيل السيرفر (حماية إلزامية).');
+// لا يُسمح بتشغيل السيرفر بدون حساب مشرف (ADMIN) محدَّد صراحة في .env.
+// حساب المشاهدة (VIEWER) اختياري: إن لم يُحدَّد، فكل من يملك رابط السيرفر
+// ولا يملك بيانات المشرف لن يستطيع الدخول إطلاقاً.
+const ADMIN_USER = process.env.ADMIN_USER;
+const ADMIN_PASS = process.env.ADMIN_PASS;
+const VIEWER_USER = process.env.VIEWER_USER;
+const VIEWER_PASS = process.env.VIEWER_PASS;
+
+if (!ADMIN_USER || !ADMIN_PASS) {
+  console.error('❌ يجب ضبط ADMIN_USER و ADMIN_PASS في ملف .env قبل تشغيل السيرفر (حماية إلزامية).');
   process.exit(1);
+}
+
+const basicAuthUsers = { [ADMIN_USER]: ADMIN_PASS };
+if (VIEWER_USER && VIEWER_PASS) {
+  basicAuthUsers[VIEWER_USER] = VIEWER_PASS;
+} else {
+  console.log('⚠ لم يتم ضبط VIEWER_USER / VIEWER_PASS — لا يوجد حساب مشاهدة منفصل، فقط حساب المشرف.');
 }
 
 // المفاتيح التي يخزّنها التطبيق (نفس مفاتيح localStorage السابقة)
@@ -63,12 +73,21 @@ const authLimiter = rateLimit({
 app.use(authLimiter);
 
 // ----- حماية Basic Auth على كل شيء (الواجهة + كل الـ API) -----
-// هذا هو الإصلاح الأهم: قبله لم يكن هناك أي حماية فعلية رغم أن .env والـ package.json يوحيان بوجودها
+// كلا الحسابين (admin و viewer) يمكنهما الدخول ومشاهدة الموقع، لكن الكتابة
+// عبر /api/state و /api/download/upload تقتصر على حساب المشرف فقط (انظر
+// requireAdmin أدناه) — هذا يمنع حساب "العرض فقط" من أن يكون قادراً فعلياً
+// على تعديل البيانات، وهي ثغرة كانت موجودة في النسخة السابقة.
 app.use(basicAuth({
-  users: { [APP_USER]: APP_PASS },
+  users: basicAuthUsers,
   challenge: true,
   realm: 'Diwan-Askari' // ملاحظة: رؤوس HTTP (WWW-Authenticate) لا تقبل حروف عربية، استخدام نص عربي هنا يسبب عطل (500) بدل رسالة تسجيل دخول (401)
 }));
+
+// وسيط: يسمح فقط لحساب المشرف بتنفيذ عمليات الكتابة (POST/DELETE)
+function requireAdmin(req, res, next) {
+  if (req.auth && req.auth.user === ADMIN_USER) return next();
+  return res.status(403).json({ ok: false, error: 'هذا الحساب للعرض فقط، لا يملك صلاحية التعديل' });
+}
 
 // حد إضافي وأصرم لمحاولات كتابة/قراءة الـ API لمنع إغراق السيرفر بطلبات متكررة بعد اجتياز تسجيل الدخول
 const apiLimiter = rateLimit({
@@ -81,17 +100,17 @@ app.use('/api/', apiLimiter);
 
 app.use(express.json({ limit: '50mb' }));
 
-// تقديم الواجهة (index.html وملفات ثابتة)
+// تقديم الواجهة (index.html وملفات ثابتة، منها shamcash-photos.json و persons-photos.json إن وُجد)
 app.use(express.static(path.join(__dirname, 'public')));
 
-// ----- واجهة برمجية: قراءة الحالة الكاملة -----
+// ----- واجهة برمجية: قراءة الحالة الكاملة (متاحة لكل من admin و viewer) -----
 app.get('/api/state', async (req, res) => {
   const state = await db.readAll();
   res.json(state);
 });
 
-// ----- واجهة برمجية: حفظ/تحديث الحالة -----
-app.post('/api/state', async (req, res) => {
+// ----- واجهة برمجية: حفظ/تحديث الحالة (للمشرف فقط) -----
+app.post('/api/state', requireAdmin, async (req, res) => {
   try {
     const { state: incoming, clientId } = req.body || {};
     if (!incoming || typeof incoming !== 'object') {
@@ -124,8 +143,8 @@ app.post('/api/state', async (req, res) => {
   }
 });
 
-// نسخة احتياطية يدوية: تنزيل الحالة كاملة
-app.get('/api/backup', async (req, res) => {
+// نسخة احتياطية يدوية: تنزيل الحالة كاملة (للمشرف فقط، تحتوي كل البيانات)
+app.get('/api/backup', requireAdmin, async (req, res) => {
   res.setHeader('Content-Disposition', 'attachment; filename="diwan-backup.json"');
   res.json(await db.readAll());
 });

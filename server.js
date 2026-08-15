@@ -46,7 +46,11 @@ const STATE_KEYS = [
   'mil_persons_edited',
   'mil_persons_deleted',
   'mil_tafaqud_archive',
-  'mil_ghiyab_archive'
+  'mil_ghiyab_archive',
+  'mil_person_events',
+  'mil_payroll',
+  'mil_payroll_headers',
+  'mil_payroll_nextId'
 ];
 
 // ----- إعداد السيرفر -----
@@ -143,6 +147,12 @@ app.post('/api/state', requireAdmin, async (req, res) => {
   }
 });
 
+// حالة الاتصال بـ Supabase (متاحة لكل من admin و viewer) — للتأكد قبل إعادة
+// نشر/تشغيل السيرفر أن الاتصال سليم وأنه لا توجد بيانات محفوظة محلياً فقط
+app.get('/api/sync-status', async (req, res) => {
+  res.json(db.getSyncStatus());
+});
+
 // نسخة احتياطية يدوية: تنزيل الحالة كاملة (للمشرف فقط، تحتوي كل البيانات)
 app.get('/api/backup', requireAdmin, async (req, res) => {
   res.setHeader('Content-Disposition', 'attachment; filename="diwan-backup.json"');
@@ -195,7 +205,14 @@ io.on('connection', (socket) => {
   socket.on('disconnect', () => {});
 });
 
-server.listen(PORT, () => {
-  console.log(`✅ سيرفر الديوان العسكري يعمل على المنفذ ${PORT}`);
-  console.log(`   افتح: http://<server-ip>:${PORT}`);
-});
+// ----- ترحيل بيانات لمرة واحدة (اختياري) — راجع migrate-persons-fix.js -----
+async function startServer() {
+  if (process.env.RUN_PERSON_FIX_2026_08 === 'true') {
+    await require('./migrate-persons-fix').run(db);
+  }
+  server.listen(PORT, () => {
+    console.log(`✅ سيرفر الديوان العسكري يعمل على المنفذ ${PORT}`);
+    console.log(`   افتح: http://<server-ip>:${PORT}`);
+  });
+}
+startServer();

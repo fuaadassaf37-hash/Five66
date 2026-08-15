@@ -5,7 +5,7 @@
 // بيانات API ومزامنة Socket.io تبقى دائماً Network-only لأن منطق
 // المزامنة (pending state) موجود بالفعل داخل index.html.
 
-const CACHE_NAME = 'diwan-shell-v5';
+const CACHE_NAME = 'diwan-shell-v4';
 const SHELL_URLS = ['/'];
 
 self.addEventListener('install', (event) => {

@@ -7,10 +7,12 @@ const path = require('path');
 const express = require('express');
 const http = require('http');
 const helmet = require('helmet');
+const compression = require('compression');
 const rateLimit = require('express-rate-limit');
 const basicAuth = require('express-basic-auth');
 const { Server } = require('socket.io');
 const db = require('./db');
+const { notifyAdminFile } = require('./notify');
 
 const PORT = process.env.PORT || 3000;
 
@@ -29,6 +31,28 @@ if (!ADMIN_USER || !ADMIN_PASS) {
 }
 
 const basicAuthUsers = { [ADMIN_USER]: ADMIN_PASS };
+const adminUsernames = new Set([ADMIN_USER]);
+
+// حسابات مشرفين إضافية مسمّاة (اختياري) — بدل أن يشترك كل الضباط بنفس حساب
+// ADMIN_USER الواحد (ما كان يجعل معرفة "من عدّل ماذا" مستحيلاً)، يمكن الآن
+// إضافة حساب منفصل لكل شخص فعلياً له صلاحية كاملة، عبر متغيّر بيئة واحد:
+// ADMIN_ACCOUNTS_JSON='{"ahmad":"كلمة_سر1","khaled":"كلمة_سر2"}'
+// كل هذه الحسابات تُعامَل كمشرفين كاملي الصلاحية مثل ADMIN_USER تماماً،
+// والفرق الوحيد هو ظهور اسم الحساب الحقيقي في سجل العمليات والتحديث الحي.
+if (process.env.ADMIN_ACCOUNTS_JSON) {
+  try {
+    const extra = JSON.parse(process.env.ADMIN_ACCOUNTS_JSON);
+    for (const [user, pass] of Object.entries(extra)) {
+      if (typeof pass !== 'string' || !pass) continue;
+      basicAuthUsers[user] = pass;
+      adminUsernames.add(user);
+    }
+    console.log(`✅ تم تحميل ${Object.keys(extra).length} حساب مشرف إضافي من ADMIN_ACCOUNTS_JSON`);
+  } catch (e) {
+    console.error('❌ ADMIN_ACCOUNTS_JSON غير صالح (يجب أن يكون JSON صحيح مثل {"user":"pass"}):', e.message);
+  }
+}
+
 if (VIEWER_USER && VIEWER_PASS) {
   basicAuthUsers[VIEWER_USER] = VIEWER_PASS;
 } else {
@@ -66,6 +90,11 @@ app.set('trust proxy', 1);
 // رؤوس أمان أساسية (helmet) — نعطّل CSP الافتراضي لأن الواجهة تحمّل سكربتات من عدة CDNs مضمّنة داخل index.html
 app.use(helmet({ contentSecurityPolicy: false }));
 
+// ضغط الاستجابات (gzip) — index.html (~7.3MB) وملفات الصور JSON وردود /api/state
+// كانت تُرسل بدون ضغط؛ هذا يقلّص حجم النقل بشكل كبير خصوصاً على شبكات الجوال البطيئة.
+// threshold: لا داعي لضغط الردود الصغيرة جداً (تكلفة CPU أكبر من الفائدة).
+app.use(compression({ threshold: 1024 }));
+
 // حماية شاملة من محاولات كسر كلمة المرور (Brute-force): حد أقصى للمحاولات على مستوى IP
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 دقيقة
@@ -87,11 +116,18 @@ app.use(basicAuth({
   realm: 'Diwan-Askari' // ملاحظة: رؤوس HTTP (WWW-Authenticate) لا تقبل حروف عربية، استخدام نص عربي هنا يسبب عطل (500) بدل رسالة تسجيل دخول (401)
 }));
 
-// وسيط: يسمح فقط لحساب المشرف بتنفيذ عمليات الكتابة (POST/DELETE)
+// وسيط: يسمح فقط لأي حساب ضمن مجموعة المشرفين (adminUsernames) بتنفيذ عمليات الكتابة (POST/DELETE)
 function requireAdmin(req, res, next) {
-  if (req.auth && req.auth.user === ADMIN_USER) return next();
+  if (req.auth && adminUsernames.has(req.auth.user)) return next();
   return res.status(403).json({ ok: false, error: 'هذا الحساب للعرض فقط، لا يملك صلاحية التعديل' });
 }
+
+// هوية المستخدم الحالي (بحسب حساب Basic Auth المُدخَل) — تتيح للواجهة عرض
+// اسم حقيقي في سجل العمليات والتحديث الحي بدل معرّف عشوائي مجهول.
+app.get('/api/whoami', (req, res) => {
+  const user = req.auth ? req.auth.user : null;
+  res.json({ user, role: user && adminUsernames.has(user) ? 'admin' : 'viewer' });
+});
 
 // حد إضافي وأصرم لمحاولات كتابة/قراءة الـ API لمنع إغراق السيرفر بطلبات متكررة بعد اجتياز تسجيل الدخول
 const apiLimiter = rateLimit({
@@ -105,7 +141,19 @@ app.use('/api/', apiLimiter);
 app.use(express.json({ limit: '50mb' }));
 
 // تقديم الواجهة (index.html وملفات ثابتة، منها shamcash-photos.json و persons-photos.json إن وُجد)
-app.use(express.static(path.join(__dirname, 'public')));
+// caching: ملفات الصور (persons-photos.json / shamcash-photos.json) كبيرة نسبياً ونادراً
+// ما تتغيّر بين نشر وآخر؛ نمنحها cache قصير مع إلزام المتصفح بالتحقق من التغيّر (must-revalidate)
+// بدل إعادة تحميلها بالكامل في كل زيارة. index.html نفسه لا يُخزَّن مؤقتاً لأنه يتغيّر مع كل تحديث للتطبيق.
+app.use(express.static(path.join(__dirname, 'public'), {
+  etag: true,
+  setHeaders: (res, filePath) => {
+    if (filePath.endsWith('.json') && (filePath.includes('photos'))) {
+      res.setHeader('Cache-Control', 'public, max-age=3600, must-revalidate');
+    } else if (filePath.endsWith('.html')) {
+      res.setHeader('Cache-Control', 'no-cache');
+    }
+  }
+}));
 
 // ----- واجهة برمجية: قراءة الحالة الكاملة (متاحة لكل من admin و viewer) -----
 app.get('/api/state', async (req, res) => {
@@ -137,8 +185,8 @@ app.post('/api/state', requireAdmin, async (req, res) => {
     }
     const saved = await db.writeMany(entries);
 
-    // إشعار جميع المستخدمين المتصلين بوجود تحديث
-    io.emit('state-changed', { clientId, updatedAt: saved._updatedAt });
+    // إشعار جميع المستخدمين المتصلين بوجود تحديث (مع اسم الحساب الفعلي الذي عدّل، وليس فقط clientId عشوائي)
+    io.emit('state-changed', { clientId, updatedAt: saved._updatedAt, user: req.auth ? req.auth.user : null });
 
     res.json({ ok: true, updatedAt: saved._updatedAt });
   } catch (e) {
@@ -204,6 +252,36 @@ app.get('/api/download/:token', (req, res) => {
 io.on('connection', (socket) => {
   socket.on('disconnect', () => {});
 });
+
+// ===================== نسخ احتياطي تلقائي دوري (عبر تيليجرام) =====================
+// كان النسخ الاحتياطي يدوياً فقط (GET /api/backup)، ما يعني أن نسيان تنزيله
+// دورياً قد يعني عدم وجود أي نسخة مستقلة عن Supabase. الآن يُرسل السيرفر
+// نسخة كاملة تلقائياً كل BACKUP_INTERVAL_HOURS ساعة (افتراضياً 6) كملف JSON
+// عبر بوت تيليجرام نفسه المستخدم في notify.js — بدون أي إعداد إضافي إن كان
+// TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID مضبوطين مسبقاً. إن لم يكونا مضبوطين،
+// تُطبع رسالة تخطّي في السجل فقط دون أي عطل بالسيرفر.
+const BACKUP_INTERVAL_HOURS = parseFloat(process.env.BACKUP_INTERVAL_HOURS) || 6;
+const BACKUP_INTERVAL_MS = BACKUP_INTERVAL_HOURS * 60 * 60 * 1000;
+
+async function runScheduledBackup() {
+  try {
+    const state = await db.readAll();
+    const json = JSON.stringify(state, null, 2);
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const filename = `diwan-backup-${stamp}.json`;
+    const sent = await notifyAdminFile(filename, json, `📦 نسخة احتياطية تلقائية — ${new Date().toLocaleString('ar')}`);
+    if (sent) console.log('✅ نسخة احتياطية تلقائية أُرسلت:', filename);
+  } catch (e) {
+    console.error('فشل النسخ الاحتياطي التلقائي:', e.message);
+  }
+}
+
+// أول نسخة بعد 5 دقائق من الإقلاع (للتأكد من عمل الإعداد فوراً دون انتظار الدورة الكاملة)
+// ثم كل BACKUP_INTERVAL_MS بعد ذلك.
+setTimeout(() => {
+  runScheduledBackup();
+  setInterval(runScheduledBackup, BACKUP_INTERVAL_MS);
+}, 5 * 60 * 1000);
 
 // ----- ترحيل بيانات لمرة واحدة (اختياري) — راجع migrate-persons-fix.js -----
 async function startServer() {

@@ -163,7 +163,7 @@ app.get('/api/backup', requireAdmin, async (req, res) => {
 const _tempFiles = new Map();
 const MAX_TEMP_FILES = 200; // حد أقصى لعدد الملفات المؤقتة المخزّنة في الذاكرة بنفس اللحظة
 
-app.post('/api/download/upload', (req, res) => {
+app.post('/api/download/upload', requireAdmin, (req, res) => {
   try {
     const { data, mime, filename } = req.body || {};
     if (!data || !mime || !filename) {
@@ -193,7 +193,7 @@ app.get('/api/download/:token', (req, res) => {
     _tempFiles.delete(req.params.token);
     return res.status(404).send('انتهت صلاحية الرابط');
   }
-  const buf = Buffer.from(entry.data, 'base64');
+  const buf = Buffer.from(String(entry.data).replace(/^data:[^,]*,/, ''), 'base64');
   res.setHeader('Content-Type', entry.mime);
   res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(entry.filename)}`);
   res.setHeader('Content-Length', buf.length);
@@ -209,6 +209,13 @@ io.on('connection', (socket) => {
 async function startServer() {
   if (process.env.RUN_PERSON_FIX_2026_08 === 'true') {
     await require('./migrate-persons-fix').run(db);
+  }
+  // فحص صحة Supabase فور الإقلاع — بدونه قد يظهر /api/sync-status بصحة جيدة
+  // خطأً لأن حالة الاتصال لا تتحدّث إلا عند أول عملية قراءة/كتابة فعلية.
+  try {
+    await db.readAll();
+  } catch (e) {
+    console.error('فحص Supabase الأولي فشل:', e.message);
   }
   server.listen(PORT, () => {
     console.log(`✅ سيرفر الديوان العسكري يعمل على المنفذ ${PORT}`);

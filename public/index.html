@@ -3643,6 +3643,7 @@ function enterApp(){
           <tbody id="ss-results-body"></tbody>
         </table>
       </div>
+      <div id="ss-results-pagination" style="display:flex;gap:8px;align-items:center;justify-content:center;padding:12px 0;font-family:Cairo,sans-serif"></div>
     </div>
   </div>
 
@@ -8787,6 +8788,8 @@ function refreshNotifications() {
 
 // ===================== SMART SEARCH & AUDIT LOG =====================
 let ssResults = [];
+const SS_RESULTS_PAGE_SIZE = 50; // نتائج البحث الذكي قد تشمل كل الأرشيف عند فلترة واسعة (مثلاً كل وحدة) — رسم آلاف الصفوف دفعة واحدة في DOM يبطئ الجوال بشدة، لذا نعرضها صفحات
+let ssResultsPage = 1;
 let ssSavedSearches = JSON.parse(_ls.get('ssSavedSearches') || '[]');
 let ssAuditLogs = JSON.parse(_ls.get('ssAuditLogs') || '[]');
 let ssCurrentAuditFilter = 'all';
@@ -8827,12 +8830,21 @@ function ssActivateMethod(method) {
 
 function ssDisplayResults(list, label) {
   ssResults = list;
+  ssResultsPage = 1;
   document.getElementById('ss-result-count').textContent = list.length;
   const summary = document.getElementById('ss-search-summary');
   if (summary) { summary.style.display = 'none'; summary.innerHTML = ''; }
-  document.getElementById('ss-results-body').innerHTML = list.map((p,i) => `
+  ssRenderResultsPage();
+  document.getElementById('ss-results-box').style.display = 'block';
+  ssAddAuditLog('search', label, { resultCount: list.length });
+}
+
+function ssRenderResultsPage() {
+  const start = (ssResultsPage - 1) * SS_RESULTS_PAGE_SIZE;
+  const slice = ssResults.slice(start, start + SS_RESULTS_PAGE_SIZE);
+  document.getElementById('ss-results-body').innerHTML = slice.map((p,i) => `
     <tr>
-      <td>${i+1}</td>
+      <td>${start+i+1}</td>
       <td style="font-weight:700">${p.name||'—'}</td>
       <td><code style="font-size:11px;background:var(--sand);padding:2px 6px;border-radius:4px">${p.milId||'—'}</code></td>
       <td>${p.unit||'—'}</td>
@@ -8841,8 +8853,25 @@ function ssDisplayResults(list, label) {
       <td><button class="btn btn-outline btn-sm" onclick="closeAllAndOpenPerson(${p.id})">عرض/تعديل</button></td>
     </tr>
   `).join('');
-  document.getElementById('ss-results-box').style.display = 'block';
-  ssAddAuditLog('search', label, { resultCount: list.length });
+  ssRenderResultsPagination();
+}
+
+function ssRenderResultsPagination() {
+  const el = document.getElementById('ss-results-pagination');
+  if (!el) return;
+  const totalPages = Math.max(1, Math.ceil(ssResults.length / SS_RESULTS_PAGE_SIZE));
+  if (totalPages <= 1) { el.innerHTML = ''; return; }
+  el.innerHTML = `
+    <button class="btn btn-outline btn-sm" ${ssResultsPage<=1?'disabled':''} onclick="ssGoToResultsPage(${ssResultsPage-1})">◀ السابق</button>
+    <span style="font-size:12px">صفحة ${ssResultsPage} من ${totalPages} (${ssResults.length} نتيجة)</span>
+    <button class="btn btn-outline btn-sm" ${ssResultsPage>=totalPages?'disabled':''} onclick="ssGoToResultsPage(${ssResultsPage+1})">التالي ▶</button>`;
+}
+
+function ssGoToResultsPage(p) {
+  const totalPages = Math.max(1, Math.ceil(ssResults.length / SS_RESULTS_PAGE_SIZE));
+  ssResultsPage = Math.min(Math.max(1, p), totalPages);
+  ssRenderResultsPage();
+  document.getElementById('ss-results-box').scrollIntoView({ behavior:'smooth', block:'start' });
 }
 
 function closeAllAndOpenPerson(id) {
@@ -9208,7 +9237,7 @@ function ssOpenMartyrsQueue() {
 
 // ===== AUDIT LOG =====
 function ssAddAuditLog(action, details, meta) {
-  const log = { action, details, ts: Date.now(), meta: meta||null };
+  const log = { action, details, ts: Date.now(), meta: meta||null, user: window._currentUser || null };
   ssAuditLogs.unshift(log);
   if(ssAuditLogs.length > 500) ssAuditLogs.length = 500;
   try { _ls.set('ssAuditLogs', JSON.stringify(ssAuditLogs)); } catch(e) {}
@@ -9251,7 +9280,7 @@ function ssRenderAuditLog() {
   el.innerHTML = list.slice(0,200).map(l => `
     <div class="ss-audit-entry ${l.action}">
       <div class="ss-audit-entry-header">
-        <span class="ss-audit-entry-action">${SS_ACTION_EMOJI[l.action]||'📌'} ${SS_ACTION_LABEL[l.action]||l.action}</span>
+        <span class="ss-audit-entry-action">${SS_ACTION_EMOJI[l.action]||'📌'} ${SS_ACTION_LABEL[l.action]||l.action}${l.user ? ' — <span style="opacity:.75;font-weight:600">'+escapeHtml(l.user)+'</span>' : ''}</span>
         <span class="ss-audit-entry-time">${ssFormatTime(l.ts)}</span>
       </div>
       <div class="ss-audit-entry-details">${l.details}</div>
@@ -13215,16 +13244,39 @@ function _getPendingSyncAt() {
     return 0;
   }
 }
+// تجميع الإرسال للسيرفر (debounce): التعديلات السريعة المتتالية (كتابة في حقل،
+// تعديل عدة صفوف، حذف جماعي) كانت كل واحدة منها ترسل طلب POST كامل فوراً —
+// هذا يستهلك حد apiLimiter بسرعة (120 طلب/دقيقة) وقد يسبب رفض طلبات (429) عند
+// التعديل المكثف. الآن: نحفظ محلياً فوراً (لا يُفقد شيء أبداً حتى بدون إنترنت)،
+// وننتظر توقف المستخدم عن الكتابة لفترة قصيرة قبل الإرسال الفعلي.
+var _SYNC_DEBOUNCE_MS = 1200;
+var _syncDebounceTimer = null;
 function saveState() {
   try {
     var _state = _buildStateSnapshot();
     for(var _k in _state){ _ls.set(_k, _state[_k]); }
     _setPendingSyncState(_state);
     var si = document.getElementById('auto-save-ind');
-    if(si){ si.textContent='⏳ جارٍ الحفظ...'; si.style.opacity='1'; }
-    syncStateToServer(_state, si);
+    if(si){ si.textContent='⏳ سيُحفظ خلال لحظات...'; si.style.opacity='1'; }
+    clearTimeout(_syncDebounceTimer);
+    _syncDebounceTimer = setTimeout(function(){
+      var pending = _getPendingSyncState();
+      if(!pending) return;
+      if(si){ si.textContent='⏳ جارٍ الحفظ...'; si.style.opacity='1'; }
+      syncStateToServer(pending, si);
+    }, _SYNC_DEBOUNCE_MS);
   } catch(e){ console.warn('saveState:',e); }
 }
+// إرسال فوري بدون انتظار الـ debounce — يُستخدم عند مغادرة الصفحة/إخفائها
+// حتى لا يبقى تعديل معلّق في الذاكرة فقط دون إرسال.
+function _forceFlushNow() {
+  clearTimeout(_syncDebounceTimer);
+  var pending = _getPendingSyncState();
+  if(pending) syncStateToServer(pending, document.getElementById('auto-save-ind'));
+}
+document.addEventListener('visibilitychange', function(){ if(document.hidden) _forceFlushNow(); });
+window.addEventListener('pagehide', _forceFlushNow);
+window.addEventListener('beforeunload', _forceFlushNow);
 
 // ===================== مزامنة مع السيرفر =====================
 var _SYNC_URL = (window.SERVER_SYNC_URL || (location.origin + '/api/state'));
@@ -18659,35 +18711,56 @@ function showImportResults(results, fileName, selectedColumn) {
 <script>
 (function(){
   window._clientId = 'c_' + Math.random().toString(36).slice(2) + Date.now();
+  window._currentUser = null;
+  // جلب هوية الحساب الحقيقي (من Basic Auth) لعرضه في سجل العمليات والتحديث
+  // الحي بدل معرّف عشوائي مجهول — يفيد خصوصاً بعد دعم عدة حسابات مشرفين.
+  fetch('/api/whoami').then(function(r){ return r.ok ? r.json() : null; }).then(function(info){
+    if(info && info.user) window._currentUser = info.user;
+  }).catch(function(){});
   try {
     var socket = io();
+    var _lastRemoteUser = null;
     socket.on('state-changed', function(data){
       if(data && data.clientId === window._clientId) return; // تحديثنا نحن
+      _lastRemoteUser = (data && data.user) || null;
       // إن كان هناك نموذج/بطاقة مفتوحة، لا نمزج تلقائياً حتى لا نفقد تعديلاً غير محفوظ —
       // نكتفي بشريط تنبيه غير ملزم يتيح للمستخدم اختيار التحديث متى أراد.
       var openModalEl = document.querySelector('.modal-overlay.open');
       var openDrawerEl = document.querySelector('.drawer.open');
       if (openModalEl || openDrawerEl) {
-        showRemoteUpdateBar();
+        showRemoteUpdateBar(_lastRemoteUser);
         return;
       }
       if (typeof refreshAppData === 'function') {
         refreshAppData();
       } else {
-        showRemoteUpdateBar();
+        showRemoteUpdateBar(_lastRemoteUser);
       }
     });
 
-    function showRemoteUpdateBar(){
+    function showRemoteUpdateBar(byUser){
       var bar = document.getElementById('remote-update-bar');
       if(!bar){
         bar = document.createElement('div');
         bar.id = 'remote-update-bar';
         bar.style.cssText = 'position:fixed;bottom:0;left:0;right:0;z-index:99999;background:#243318;color:#f5e08a;border-top:2px solid #c8a84b;padding:12px;text-align:center;font-family:Cairo,Tajawal,sans-serif;font-weight:700;cursor:pointer;box-shadow:0 -4px 14px rgba(0,0,0,.4);';
-        bar.textContent = '⚠ تم تحديث البيانات من مستخدم آخر — اضغط هنا لتحميل آخر التحديثات';
-        bar.onclick = function(){ location.reload(); };
+        bar.onclick = function(){
+          // نغلق أي نافذة/دروار مفتوح كان يمنع الدمج الحي التلقائي (كان يحتوي
+          // تعديلاً غير محفوظ، لذا الإغلاق هنا مقصود ومتوقَّع من ضغطة المستخدم)
+          document.querySelectorAll('.modal-overlay.open').forEach(function(el){ el.classList.remove('open'); });
+          document.querySelectorAll('.drawer.open').forEach(function(el){ el.classList.remove('open'); });
+          bar.remove();
+          if (typeof refreshAppData === 'function') {
+            refreshAppData();
+          } else {
+            location.reload();
+          }
+        };
         document.body.appendChild(bar);
       }
+      bar.textContent = byUser
+        ? ('⚠ تم تحديث البيانات بواسطة "' + byUser + '" — اضغط هنا لتحميل آخر التحديثات')
+        : '⚠ تم تحديث البيانات من مستخدم آخر — اضغط هنا لتحميل آخر التحديثات';
     }
   } catch(e){ console.warn('socket init:', e); }
 })();

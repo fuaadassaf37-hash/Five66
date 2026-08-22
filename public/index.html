@@ -3475,6 +3475,12 @@ function enterApp(){
     </div>
     <p style="font-size:12px;color:#777;margin:0 0 12px;font-family:Cairo">كل بطاقة تمثّل جلسة واحدة (تاريخ + دوام) — تعرض جدول التفقد المرتبط بها وسجل الغياب المقابل له معاً. عند اعتماد جدول تفقد جديد يُنشأ تلقائياً سجل غياب مرتبط بنفس التاريخ والدوام جاهز للتعبئة.</p>
     <div id="unified-archive-list"></div>
+    <div style="margin-top:22px;padding-top:18px;border-top:2px dashed var(--sand-dark)">
+      <div class="section-header" style="margin-bottom:8px"><h3 style="margin:0">🗂️ سجل الإجراءات المؤرشف</h3></div>
+      <p style="font-size:12px;color:#777;margin:0 0 10px;font-family:Cairo">يحفظ تلقائياً كل جدول تفقد أو غياب أو خصم، إضافة إلى الإجراءات اليدوية، مع نسخة من السجلات وقت الاعتماد.</p>
+      <input id="operational-archive-search" type="search" oninput="Five66Archive.render()" placeholder="🔍 ابحث باسم الإجراء أو التاريخ أو النوع..." style="width:100%;box-sizing:border-box;padding:9px 12px;border:1px solid var(--sand-dark);border-radius:8px;font-family:Cairo;direction:rtl;margin-bottom:10px">
+      <div id="operational-archive-list"></div>
+    </div>
   </div>
 
   <!-- ===== تقرير الغياب المتكرر — بحسب فترة زمنية محددة ===== -->
@@ -8259,6 +8265,7 @@ function mergeSpecialRegistryRecordsIntoArchive() {
 // كل حدث: { id, personId, type, date, title, details, status, createdAt, source }
 // source: 'auto' (تم توليده تلقائياً من قسم آخر) أو 'manual' (أضافه المستخدم يدوياً)
 var personEvents = [];
+var operationalArchiveDocuments = [];
 
 var EVENT_TYPES = {
   tafaqud:  { icon: '📋', label: 'تفقد',        color: '#556b2f' },
@@ -13681,6 +13688,7 @@ function _buildStateSnapshot() {
   _state.mil_tafaqud_archive = JSON.stringify(tafaqudArchive);
   _state.mil_ghiyab_archive = JSON.stringify(ghiyabArchive);
   _state.mil_person_events = JSON.stringify(personEvents);
+  _state.mil_operational_archive = JSON.stringify(operationalArchiveDocuments);
   _state.mil_payroll = JSON.stringify(payrollRecords);
   _state.mil_payroll_headers = JSON.stringify(payrollHeaders);
   _state.mil_payroll_nextId = String(payrollNextId);
@@ -13914,6 +13922,8 @@ async function loadState() {
     if(gha) ghiyabArchive = JSON.parse(gha);
     const pev = _get('mil_person_events');
     if(pev) personEvents = JSON.parse(pev);
+    const oar = _get('mil_operational_archive');
+    if(oar) operationalArchiveDocuments = JSON.parse(oar);
 
     const pr = _get('mil_payroll');
     if(pr) payrollRecords = JSON.parse(pr);
@@ -15934,6 +15944,7 @@ function renderUnifiedArchiveList() {
       </div>
     </div>`;
   }).join('');
+  if(window.Five66Archive) window.Five66Archive.render();
 }
 
 // ===== تسجيل الغياب انطلاقاً من جلسة تفقد معتمدة: عرض أفراد جدول التفقد نفسه كقائمة تحديد =====
@@ -19701,7 +19712,7 @@ function matchWithArchiveImproved(importedRows, selectedColumn) {
     if (typeof persons !== 'undefined' && Array.isArray(persons)) {
       foundRecord = persons.find(function(p) {
         // المطابقة المباشرة
-        if (p.milid && p.milid.toString().trim() === keyValue) {
+        if (p.milId && p.milId.toString().trim() === keyValue) {
           return true;
         }
         return false;
@@ -19754,7 +19765,7 @@ function showImportResults(results, fileName, selectedColumn) {
       var displayValue = m.importedData[selectedColumn];
       resultsHTML += '<div style="padding:10px;border-bottom:1px solid #f0ebe0;font-size:11px;color:#3a3a2a;">' +
         '<div style="font-weight:700;color:#2e7d32;">✓ الصف ' + m.row + ': ' + displayName + '</div>' +
-        '<div style="color:#8a6a1a;font-size:10px;margin-top:4px;">🔑 ' + selectedColumn + ': ' + displayValue + ' → الرقم العسكري: ' + m.archiveData.milid + '</div>' +
+        '<div style="color:#8a6a1a;font-size:10px;margin-top:4px;">🔑 ' + selectedColumn + ': ' + displayValue + ' → الرقم العسكري: ' + m.archiveData.milId + '</div>' +
         '</div>';
     });
   }
@@ -19836,9 +19847,12 @@ function showImportResults(results, fileName, selectedColumn) {
         flushPendingSync(_ensureSaveIndicator());
       }
     });
-    socket.on('state-changed', function(data){
-      if(data && data.clientId === window._clientId) return; // تحديثنا نحن
-      _lastRemoteUser = (data && data.user) || null;
+    // ملاحظة: السيرفر يبثّ التحديثات عبر الحدث 'sync:operations' (راجع server.js)
+    // وليس 'state-changed' القديم — الاسم القديم لا يُطلَق إطلاقاً من السيرفر الحالي.
+    socket.on('sync:operations', function(data){
+      var ops = (data && data.operations) || [];
+      if (!ops.length) return;
+      _lastRemoteUser = ops[ops.length - 1].actor || null;
       // إن كان هناك نموذج/بطاقة مفتوحة، لا نمزج تلقائياً حتى لا نفقد تعديلاً غير محفوظ —
       // نكتفي بشريط تنبيه غير ملزم يتيح للمستخدم اختيار التحديث متى أراد.
       var openModalEl = document.querySelector('.modal-overlay.open');
@@ -19847,7 +19861,9 @@ function showImportResults(results, fileName, selectedColumn) {
         showRemoteUpdateBar(_lastRemoteUser);
         return;
       }
-      if (typeof refreshAppData === 'function') {
+      if (window.Five66Sync && typeof window.Five66Sync.pull === 'function') {
+        window.Five66Sync.pull().catch(function(){});
+      } else if (typeof refreshAppData === 'function') {
         refreshAppData();
       } else {
         showRemoteUpdateBar(_lastRemoteUser);
@@ -19974,7 +19990,7 @@ function showImportResults(results, fileName, selectedColumn) {
   var UNDO_MAX = 20;
   window._undoLastKnownSnapshot = null;
 
-  var UNDO_VARS = ['persons','khasmRows','injured','martyrs','hararin','tafaqudArchive','ghiyabArchive','personEvents','payrollRecords','payrollHeaders'];
+  var UNDO_VARS = ['persons','khasmRows','injured','martyrs','hararin','tafaqudArchive','ghiyabArchive','personEvents','operationalArchiveDocuments','payrollRecords','payrollHeaders'];
   var UNDO_SCALARS = ['nextId','payrollNextId'];
 
   function _captureLiveState(){
@@ -20071,5 +20087,13 @@ function showImportResults(results, fileName, selectedColumn) {
   });
 })();
 </script>
+<script src="/archive-ledger.js"></script>
+<script>
+  if (window.Five66Archive) {
+    window.Five66Archive.installActionHooks();
+    document.addEventListener('DOMContentLoaded', function () { window.Five66Archive.render(); });
+  }
+</script>
+<script src="/sync-v2.js"></script>
 </body>
 </html>

@@ -4,7 +4,8 @@
   "description": "سيرفر الديوان العسكري - مزامنة البيانات عبر الشبكة",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "test": "node --test tests/sync-store.test.mjs tests/sync-db.test.cjs tests/archive-ledger.test.cjs tests/durable-sync.test.cjs"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.45.0",

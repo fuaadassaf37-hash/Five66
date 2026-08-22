@@ -7,56 +7,35 @@ const path = require('path');
 const express = require('express');
 const http = require('http');
 const helmet = require('helmet');
-const compression = require('compression');
 const rateLimit = require('express-rate-limit');
 const basicAuth = require('express-basic-auth');
 const { Server } = require('socket.io');
 const db = require('./db');
-const { notifyAdminFile } = require('./notify');
+const syncDb = require('./sync-db');
 
 const PORT = process.env.PORT || 3000;
 
-// ----- تحقق إلزامي من وجود بيانات الدخول -----
-// لا يُسمح بتشغيل السيرفر بدون حساب مشرف (ADMIN) محدَّد صراحة في .env.
-// حساب المشاهدة (VIEWER) اختياري: إن لم يُحدَّد، فكل من يملك رابط السيرفر
-// ولا يملك بيانات المشرف لن يستطيع الدخول إطلاقاً.
-const ADMIN_USER = process.env.ADMIN_USER;
-const ADMIN_PASS = process.env.ADMIN_PASS;
-const VIEWER_USER = process.env.VIEWER_USER;
-const VIEWER_PASS = process.env.VIEWER_PASS;
-
-if (!ADMIN_USER || !ADMIN_PASS) {
-  console.error('❌ يجب ضبط ADMIN_USER و ADMIN_PASS في ملف .env قبل تشغيل السيرفر (حماية إلزامية).');
-  process.exit(1);
-}
-
-const basicAuthUsers = { [ADMIN_USER]: ADMIN_PASS };
-const adminUsernames = new Set([ADMIN_USER]);
-
-// حسابات مشرفين إضافية مسمّاة (اختياري) — بدل أن يشترك كل الضباط بنفس حساب
-// ADMIN_USER الواحد (ما كان يجعل معرفة "من عدّل ماذا" مستحيلاً)، يمكن الآن
-// إضافة حساب منفصل لكل شخص فعلياً له صلاحية كاملة، عبر متغيّر بيئة واحد:
-// ADMIN_ACCOUNTS_JSON='{"ahmad":"كلمة_سر1","khaled":"كلمة_سر2"}'
-// كل هذه الحسابات تُعامَل كمشرفين كاملي الصلاحية مثل ADMIN_USER تماماً،
-// والفرق الوحيد هو ظهور اسم الحساب الحقيقي في سجل العمليات والتحديث الحي.
-if (process.env.ADMIN_ACCOUNTS_JSON) {
-  try {
-    const extra = JSON.parse(process.env.ADMIN_ACCOUNTS_JSON);
-    for (const [user, pass] of Object.entries(extra)) {
-      if (typeof pass !== 'string' || !pass) continue;
-      basicAuthUsers[user] = pass;
-      adminUsernames.add(user);
-    }
-    console.log(`✅ تم تحميل ${Object.keys(extra).length} حساب مشرف إضافي من ADMIN_ACCOUNTS_JSON`);
-  } catch (e) {
-    console.error('❌ ADMIN_ACCOUNTS_JSON غير صالح (يجب أن يكون JSON صحيح مثل {"user":"pass"}):', e.message);
+// ----- مصادقة الخادم الموحدة -----
+// كل بيانات مرور صحيحة تمنح الوصول نفسه. لا توجد أدوار admin أو viewer داخل التطبيق أو الخادم.
+function getBasicAuthUsers() {
+  if (process.env.BASIC_AUTH_USERS_JSON) {
+    try {
+      const users = JSON.parse(process.env.BASIC_AUTH_USERS_JSON);
+      if (users && typeof users === 'object' && Object.keys(users).length) return users;
+    } catch (_) {}
   }
+  const users = {};
+  // دعم أسماء المتغيرات القديمة أثناء الترحيل، من دون منح أي منهما دوراً مختلفاً.
+  if (process.env.ADMIN_USER && process.env.ADMIN_PASS) users[process.env.ADMIN_USER] = process.env.ADMIN_PASS;
+  if (process.env.VIEWER_USER && process.env.VIEWER_PASS) users[process.env.VIEWER_USER] = process.env.VIEWER_PASS;
+  if (process.env.BASIC_AUTH_USER && process.env.BASIC_AUTH_PASSWORD) users[process.env.BASIC_AUTH_USER] = process.env.BASIC_AUTH_PASSWORD;
+  return users;
 }
 
-if (VIEWER_USER && VIEWER_PASS) {
-  basicAuthUsers[VIEWER_USER] = VIEWER_PASS;
-} else {
-  console.log('⚠ لم يتم ضبط VIEWER_USER / VIEWER_PASS — لا يوجد حساب مشاهدة منفصل، فقط حساب المشرف.');
+const basicAuthUsers = getBasicAuthUsers();
+if (!Object.keys(basicAuthUsers).length) {
+  console.error('❌ يجب ضبط BASIC_AUTH_USER/BASIC_AUTH_PASSWORD أو BASIC_AUTH_USERS_JSON قبل التشغيل.');
+  process.exit(1);
 }
 
 // المفاتيح التي يخزّنها التطبيق (نفس مفاتيح localStorage السابقة)
@@ -72,6 +51,7 @@ const STATE_KEYS = [
   'mil_tafaqud_archive',
   'mil_ghiyab_archive',
   'mil_person_events',
+  'mil_operational_archive',
   'mil_payroll',
   'mil_payroll_headers',
   'mil_payroll_nextId'
@@ -90,11 +70,6 @@ app.set('trust proxy', 1);
 // رؤوس أمان أساسية (helmet) — نعطّل CSP الافتراضي لأن الواجهة تحمّل سكربتات من عدة CDNs مضمّنة داخل index.html
 app.use(helmet({ contentSecurityPolicy: false }));
 
-// ضغط الاستجابات (gzip) — index.html (~7.3MB) وملفات الصور JSON وردود /api/state
-// كانت تُرسل بدون ضغط؛ هذا يقلّص حجم النقل بشكل كبير خصوصاً على شبكات الجوال البطيئة.
-// threshold: لا داعي لضغط الردود الصغيرة جداً (تكلفة CPU أكبر من الفائدة).
-app.use(compression({ threshold: 1024 }));
-
 // حماية شاملة من محاولات كسر كلمة المرور (Brute-force): حد أقصى للمحاولات على مستوى IP
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 دقيقة
@@ -106,28 +81,11 @@ const authLimiter = rateLimit({
 app.use(authLimiter);
 
 // ----- حماية Basic Auth على كل شيء (الواجهة + كل الـ API) -----
-// كلا الحسابين (admin و viewer) يمكنهما الدخول ومشاهدة الموقع، لكن الكتابة
-// عبر /api/state و /api/download/upload تقتصر على حساب المشرف فقط (انظر
-// requireAdmin أدناه) — هذا يمنع حساب "العرض فقط" من أن يكون قادراً فعلياً
-// على تعديل البيانات، وهي ثغرة كانت موجودة في النسخة السابقة.
 app.use(basicAuth({
   users: basicAuthUsers,
   challenge: true,
-  realm: 'Diwan-Askari' // ملاحظة: رؤوس HTTP (WWW-Authenticate) لا تقبل حروف عربية، استخدام نص عربي هنا يسبب عطل (500) بدل رسالة تسجيل دخول (401)
+  realm: 'Five66-IqZ9'
 }));
-
-// وسيط: يسمح فقط لأي حساب ضمن مجموعة المشرفين (adminUsernames) بتنفيذ عمليات الكتابة (POST/DELETE)
-function requireAdmin(req, res, next) {
-  if (req.auth && adminUsernames.has(req.auth.user)) return next();
-  return res.status(403).json({ ok: false, error: 'هذا الحساب للعرض فقط، لا يملك صلاحية التعديل' });
-}
-
-// هوية المستخدم الحالي (بحسب حساب Basic Auth المُدخَل) — تتيح للواجهة عرض
-// اسم حقيقي في سجل العمليات والتحديث الحي بدل معرّف عشوائي مجهول.
-app.get('/api/whoami', (req, res) => {
-  const user = req.auth ? req.auth.user : null;
-  res.json({ user, role: user && adminUsernames.has(user) ? 'admin' : 'viewer' });
-});
 
 // حد إضافي وأصرم لمحاولات كتابة/قراءة الـ API لمنع إغراق السيرفر بطلبات متكررة بعد اجتياز تسجيل الدخول
 const apiLimiter = rateLimit({
@@ -141,19 +99,11 @@ app.use('/api/', apiLimiter);
 app.use(express.json({ limit: '50mb' }));
 
 // تقديم الواجهة (index.html وملفات ثابتة، منها shamcash-photos.json و persons-photos.json إن وُجد)
-// caching: ملفات الصور (persons-photos.json / shamcash-photos.json) كبيرة نسبياً ونادراً
-// ما تتغيّر بين نشر وآخر؛ نمنحها cache قصير مع إلزام المتصفح بالتحقق من التغيّر (must-revalidate)
-// بدل إعادة تحميلها بالكامل في كل زيارة. index.html نفسه لا يُخزَّن مؤقتاً لأنه يتغيّر مع كل تحديث للتطبيق.
-app.use(express.static(path.join(__dirname, 'public'), {
-  etag: true,
-  setHeaders: (res, filePath) => {
-    if (filePath.endsWith('.json') && (filePath.includes('photos'))) {
-      res.setHeader('Cache-Control', 'public, max-age=3600, must-revalidate');
-    } else if (filePath.endsWith('.html')) {
-      res.setHeader('Cache-Control', 'no-cache');
-    }
-  }
-}));
+app.use(express.static(path.join(__dirname, 'public')));
+
+app.get('/api/whoami', (req, res) => {
+  res.json({ user: req.auth?.user || null });
+});
 
 // ----- واجهة برمجية: قراءة الحالة الكاملة (متاحة لكل من admin و viewer) -----
 app.get('/api/state', async (req, res) => {
@@ -161,48 +111,43 @@ app.get('/api/state', async (req, res) => {
   res.json(state);
 });
 
-// ----- واجهة برمجية: حفظ/تحديث الحالة (للمشرف فقط) -----
-app.post('/api/state', requireAdmin, async (req, res) => {
+// المسار القديم للقراءة يبقى مؤقتاً لفتح البيانات السابقة، أما الكتابة فتتم فقط عبر عمليات الإصدار الدقيقة.
+app.post('/api/state', (req, res) => {
+  res.status(410).json({ ok: false, error: 'تم استبدال الحفظ الكامل بمزامنة دقيقة لكل سجل. حدّث الصفحة ثم حاول مجدداً.' });
+});
+
+app.get('/api/sync/bootstrap', async (req, res) => {
   try {
-    const { state: incoming, clientId } = req.body || {};
-    if (!incoming || typeof incoming !== 'object') {
-      return res.status(400).json({ ok: false, error: 'بيانات غير صالحة' });
-    }
-    const MAX_VALUE_LENGTH = 15 * 1024 * 1024; // 15MB كحد أقصى لكل مفتاح (نص JSON)
-    const entries = {};
-    for (const key of STATE_KEYS) {
-      if (Object.prototype.hasOwnProperty.call(incoming, key)) {
-        const value = incoming[key];
-        // القيم يجب أن تكون نصوصاً (JSON.stringify من جهة الواجهة) أو أرقام/فارغة، وليست كائنات معقدة غير متوقعة
-        if (value !== null && typeof value !== 'string' && typeof value !== 'number') {
-          return res.status(400).json({ ok: false, error: `قيمة غير صالحة للمفتاح ${key}` });
-        }
-        if (typeof value === 'string' && value.length > MAX_VALUE_LENGTH) {
-          return res.status(413).json({ ok: false, error: `حجم البيانات كبير جداً للمفتاح ${key}` });
-        }
-        entries[key] = value;
-      }
-    }
-    const saved = await db.writeMany(entries);
+    const since = Number.parseInt(req.query.since || '0', 10);
+    res.json(await syncDb.bootstrap(Number.isFinite(since) ? since : 0));
+  } catch (error) {
+    const statusCode = error?.statusCode || 500;
+    res.status(statusCode).json({ ok: false, error: statusCode === 503 ? 'التخزين الدائم غير متاح مؤقتاً؛ سيحتفظ التطبيق بالتعديلات محلياً ويعيد المحاولة.' : 'تعذر جلب تحديثات المزامنة' });
+  }
+});
 
-    // إشعار جميع المستخدمين المتصلين بوجود تحديث (مع اسم الحساب الفعلي الذي عدّل، وليس فقط clientId عشوائي)
-    io.emit('state-changed', { clientId, updatedAt: saved._updatedAt, user: req.auth ? req.auth.user : null });
-
-    res.json({ ok: true, updatedAt: saved._updatedAt });
-  } catch (e) {
-    console.error('POST /api/state error:', e);
-    res.status(500).json({ ok: false, error: 'خطأ في السيرفر' });
+app.post('/api/sync/operations', async (req, res) => {
+  try {
+    const operations = Array.isArray(req.body?.operations) ? req.body.operations : [];
+    if (!operations.length) return res.status(400).json({ ok: false, error: 'مطلوب إرسال عملية مزامنة واحدة على الأقل' });
+    const result = await syncDb.applyOperations(operations, req.auth?.user || 'server-user');
+    if (result.accepted.length) io.emit('sync:operations', { operations: result.accepted, serverSequence: result.serverSequence });
+    res.json({ results: result.results, serverSequence: result.serverSequence, backend: result.backend });
+  } catch (error) {
+    console.error('POST /api/sync/operations error:', error);
+    const statusCode = error?.statusCode || 500;
+    res.status(statusCode).json({ ok: false, error: statusCode === 503 ? 'التخزين الدائم غير متاح مؤقتاً؛ لم تُفقد تعديلاتك وسيعيد التطبيق المحاولة.' : 'تعذر حفظ عمليات المزامنة' });
   }
 });
 
 // حالة الاتصال بـ Supabase (متاحة لكل من admin و viewer) — للتأكد قبل إعادة
 // نشر/تشغيل السيرفر أن الاتصال سليم وأنه لا توجد بيانات محفوظة محلياً فقط
 app.get('/api/sync-status', async (req, res) => {
-  res.json(db.getSyncStatus());
+  res.json({ legacy: db.getSyncStatus(), preciseSync: syncDb.status() });
 });
 
-// نسخة احتياطية يدوية: تنزيل الحالة كاملة (للمشرف فقط، تحتوي كل البيانات)
-app.get('/api/backup', requireAdmin, async (req, res) => {
+// نسخة احتياطية يدوية: متاحة لكل من يملك بيانات مرور الخادم.
+app.get('/api/backup', async (req, res) => {
   res.setHeader('Content-Disposition', 'attachment; filename="diwan-backup.json"');
   res.json(await db.readAll());
 });
@@ -211,7 +156,7 @@ app.get('/api/backup', requireAdmin, async (req, res) => {
 const _tempFiles = new Map();
 const MAX_TEMP_FILES = 200; // حد أقصى لعدد الملفات المؤقتة المخزّنة في الذاكرة بنفس اللحظة
 
-app.post('/api/download/upload', requireAdmin, (req, res) => {
+app.post('/api/download/upload', (req, res) => {
   try {
     const { data, mime, filename } = req.body || {};
     if (!data || !mime || !filename) {
@@ -241,7 +186,7 @@ app.get('/api/download/:token', (req, res) => {
     _tempFiles.delete(req.params.token);
     return res.status(404).send('انتهت صلاحية الرابط');
   }
-  const buf = Buffer.from(String(entry.data).replace(/^data:[^,]*,/, ''), 'base64');
+  const buf = Buffer.from(entry.data, 'base64');
   res.setHeader('Content-Type', entry.mime);
   res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(entry.filename)}`);
   res.setHeader('Content-Length', buf.length);
@@ -253,47 +198,10 @@ io.on('connection', (socket) => {
   socket.on('disconnect', () => {});
 });
 
-// ===================== نسخ احتياطي تلقائي دوري (عبر تيليجرام) =====================
-// كان النسخ الاحتياطي يدوياً فقط (GET /api/backup)، ما يعني أن نسيان تنزيله
-// دورياً قد يعني عدم وجود أي نسخة مستقلة عن Supabase. الآن يُرسل السيرفر
-// نسخة كاملة تلقائياً كل BACKUP_INTERVAL_HOURS ساعة (افتراضياً 6) كملف JSON
-// عبر بوت تيليجرام نفسه المستخدم في notify.js — بدون أي إعداد إضافي إن كان
-// TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID مضبوطين مسبقاً. إن لم يكونا مضبوطين،
-// تُطبع رسالة تخطّي في السجل فقط دون أي عطل بالسيرفر.
-const BACKUP_INTERVAL_HOURS = parseFloat(process.env.BACKUP_INTERVAL_HOURS) || 6;
-const BACKUP_INTERVAL_MS = BACKUP_INTERVAL_HOURS * 60 * 60 * 1000;
-
-async function runScheduledBackup() {
-  try {
-    const state = await db.readAll();
-    const json = JSON.stringify(state, null, 2);
-    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-    const filename = `diwan-backup-${stamp}.json`;
-    const sent = await notifyAdminFile(filename, json, `📦 نسخة احتياطية تلقائية — ${new Date().toLocaleString('ar')}`);
-    if (sent) console.log('✅ نسخة احتياطية تلقائية أُرسلت:', filename);
-  } catch (e) {
-    console.error('فشل النسخ الاحتياطي التلقائي:', e.message);
-  }
-}
-
-// أول نسخة بعد 5 دقائق من الإقلاع (للتأكد من عمل الإعداد فوراً دون انتظار الدورة الكاملة)
-// ثم كل BACKUP_INTERVAL_MS بعد ذلك.
-setTimeout(() => {
-  runScheduledBackup();
-  setInterval(runScheduledBackup, BACKUP_INTERVAL_MS);
-}, 5 * 60 * 1000);
-
 // ----- ترحيل بيانات لمرة واحدة (اختياري) — راجع migrate-persons-fix.js -----
 async function startServer() {
   if (process.env.RUN_PERSON_FIX_2026_08 === 'true') {
     await require('./migrate-persons-fix').run(db);
-  }
-  // فحص صحة Supabase فور الإقلاع — بدونه قد يظهر /api/sync-status بصحة جيدة
-  // خطأً لأن حالة الاتصال لا تتحدّث إلا عند أول عملية قراءة/كتابة فعلية.
-  try {
-    await db.readAll();
-  } catch (e) {
-    console.error('فحص Supabase الأولي فشل:', e.message);
   }
   server.listen(PORT, () => {
     console.log(`✅ سيرفر الديوان العسكري يعمل على المنفذ ${PORT}`);

@@ -32,31 +32,4 @@ async function notifyAdmin(message) {
   }
 }
 
-// إرسال ملف كمستند عبر تيليجرام — يُستخدم للنسخ الاحتياطية الدورية.
-// الهدف من إرسالها عبر تيليجرام تحديداً (وليس فقط حفظها محلياً على Railway):
-// نظام ملفات Railway مؤقت ويُمحى عند كل إعادة نشر، بينما تيليجرام يحفظ
-// الملف بشكل دائم خارج السيرفر تماماً — نسخة احتياطية مستقلة عن كل من
-// Railway و Supabase في آن واحد.
-async function notifyAdminFile(filename, content, caption) {
-  console.log('[نسخة احتياطية]', filename, `(${content.length} حرف)`, configured ? '— جارٍ الإرسال عبر تيليجرام' : '— تيليجرام غير مُعدّ، تخطّي الإرسال');
-  if (!configured) return false;
-  try {
-    const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendDocument`;
-    const form = new FormData();
-    form.append('chat_id', TELEGRAM_CHAT_ID);
-    if (caption) form.append('caption', caption);
-    form.append('document', new Blob([content], { type: 'application/json' }), filename);
-    const res = await fetch(url, { method: 'POST', body: form });
-    if (!res.ok) {
-      const t = await res.text().catch(() => '');
-      console.error('فشل إرسال ملف النسخة الاحتياطية عبر تيليجرام:', res.status, t);
-      return false;
-    }
-    return true;
-  } catch (e) {
-    console.error('خطأ في إرسال ملف النسخة الاحتياطية:', e.message);
-    return false;
-  }
-}
-
-module.exports = { notifyAdmin, notifyAdminFile, configured };
+module.exports = { notifyAdmin, configured };
